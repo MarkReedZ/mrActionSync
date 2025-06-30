@@ -15,12 +15,13 @@ export default class ActionSync {
     this.enablePersistence = options.enablePersistence !== undefined ? options.enablePersistence : true;
 
     // Internal state
-    this.actionQueue = [];
-    this.lastExportQueue = []; // Backup of last exported queue
+    this.actionQueue = []; // Pending actions not yet synced
+    this.fullQueue = []; // All finalized actions that have been synced
     this.lastActionId = '0';
     this.actionIdCounter = 0;
     this.syncTimer = null;
     this.storageKey = `actionsync_${this.deviceId}`;
+    this.fullQueueStorageKey = `actionsync_full_${this.deviceId}`;
 
     // Load persisted state if available
     this._initializationPromise = this._loadFromStorage().then(() => {
@@ -51,11 +52,16 @@ export default class ActionSync {
   /**
    * Dispatch an action with unique 64-bit ID
    * @param {Object} action - The action object to dispatch
+   * @param {Array<string>} filterKeys - Keys to use for deduplication (removes matching actions from queue)
    * @returns {string} The generated unique action ID
    */
-  dispatch(action) {
+  dispatch(action, filterKeys = []) {
     if (!action || typeof action !== 'object') {
       throw new Error('Action must be a valid object');
+    }
+
+    if (!Array.isArray(filterKeys)) {
+      throw new Error('filterKeys must be an array');
     }
 
     const actionId = this._generateActionId();
@@ -68,13 +74,24 @@ export default class ActionSync {
       payload: { ...action }
     };
 
+    // Apply filtering if filterKeys is provided and the new action contains all filter keys
+    let removedCount = 0;
+    if (filterKeys.length > 0 && this._actionContainsKeys(enhancedAction.payload, filterKeys)) {
+      removedCount = this._removeMatchingActions(enhancedAction.payload, filterKeys);
+    }
+
     this.actionQueue.push(enhancedAction);
     this._enforceQueueSize();
     
     // Persist changes to storage
     this._saveToStorage();
     
-    this._log('Action dispatched', { actionId, action });
+    this._log('Action dispatched', { 
+      actionId, 
+      action, 
+      filterKeys: filterKeys.length > 0 ? filterKeys : undefined,
+      removedDuplicates: removedCount || undefined
+    });
     
     if (this.autoSync && this.serverUrl) {
       // Debounced auto-sync
@@ -119,11 +136,18 @@ export default class ActionSync {
         this.lastActionId = result.lastActionId;
       }
 
-      // Clear successfully synced actions
+      // Move successfully synced actions from actionQueue to fullQueue
+      this.fullQueue.push(...this.actionQueue);
       this.actionQueue = [];
 
-      // Persist changes to storage
-      this._saveToStorage();
+      // Enforce queue size for fullQueue
+      this._enforceFullQueueSize();
+
+      // Persist changes to storage (save both queues since fullQueue changed)
+      await Promise.all([
+        this._saveToStorage(),
+        this._saveFullQueueToStorage()
+      ]);
 
       this._log('Sync completed', { 
         remotePayloadsCount: remotePayloads.length,
@@ -143,54 +167,32 @@ export default class ActionSync {
   }
 
   /**
-   * Export action queue as JSON string and clear the queue
-   * @returns {string} JSON representation of actions
+   * Export all actions (fullQueue + actionQueue) as JSON string
+   * @returns {string} JSON representation of all actions
    */
   export() {
-    // Save current queue as backup
-    this.lastExportQueue = [...this.actionQueue];
+    // Combine fullQueue and actionQueue for complete export
+    const allActions = [...this.fullQueue, ...this.actionQueue];
 
     const exportData = {
       deviceId: this.deviceId,
       timestamp: Date.now(),
-      actions: this.actionQueue,
+      actions: allActions,
       lastActionId: this.lastActionId
     };
 
     const jsonString = JSON.stringify(exportData, null, 2);
     
-    // Clear the queue after export
-    this.actionQueue = [];
-    
-    // Persist changes to storage
-    this._saveToStorage();
-    
-    this._log('Actions exported and queue cleared', { count: this.lastExportQueue.length });
+    this._log('All actions exported', { 
+      totalCount: allActions.length,
+      fullQueueCount: this.fullQueue.length,
+      actionQueueCount: this.actionQueue.length
+    });
     
     return jsonString;
   }
 
-  /**
-   * Re-export the last exported queue
-   * @returns {string} JSON representation of last exported actions
-   */
-  reexportLast() {
-    if (this.lastExportQueue.length === 0) {
-      throw new Error('No previous export to re-export');
-    }
 
-    const exportData = {
-      deviceId: this.deviceId,
-      timestamp: Date.now(),
-      actions: this.lastExportQueue,
-      lastActionId: this.lastActionId
-    };
-
-    const jsonString = JSON.stringify(exportData, null, 2);
-    this._log('Last export re-exported', { count: this.lastExportQueue.length });
-    
-    return jsonString;
-  }
 
   /**
    * Import actions from JSON string
@@ -283,7 +285,8 @@ export default class ActionSync {
     return {
       deviceId: this.deviceId,
       queueLength: this.actionQueue.length,
-      lastExportQueueLength: this.lastExportQueue.length,
+      fullQueueLength: this.fullQueue.length,
+      totalActionsCount: this.fullQueue.length + this.actionQueue.length,
       lastActionId: this.lastActionId,
       autoSync: this.autoSync,
       serverUrl: this.serverUrl,
@@ -304,6 +307,18 @@ export default class ActionSync {
   }
 
   /**
+   * Clear the full queue (use with caution - this will remove sync history)
+   */
+  async clearFullQueue() {
+    this.fullQueue = [];
+    
+    // Persist changes to storage
+    await this._saveFullQueueToStorage();
+    
+    this._log('Full queue cleared');
+  }
+
+  /**
    * Destroy the instance and cleanup
    */
   destroy() {
@@ -312,7 +327,7 @@ export default class ActionSync {
       this.syncTimer = null;
     }
     this.actionQueue = [];
-    this.lastExportQueue = [];
+    this.fullQueue = [];
     
     // Clear storage on destroy
     this._clearStorage();
@@ -343,35 +358,55 @@ export default class ActionSync {
     }
 
     try {
-      const result = await new Promise((resolve, reject) => {
-        chrome.storage.local.get([this.storageKey], (result) => {
-          if (chrome.runtime.lastError) {
-            reject(chrome.runtime.lastError);
-          } else {
-            resolve(result);
-          }
-        });
-      });
+      // Load both regular state and fullQueue in parallel
+      const [regularResult, fullQueueResult] = await Promise.all([
+        new Promise((resolve, reject) => {
+          chrome.storage.local.get([this.storageKey], (result) => {
+            if (chrome.runtime.lastError) {
+              reject(chrome.runtime.lastError);
+            } else {
+              resolve(result);
+            }
+          });
+        }),
+        new Promise((resolve, reject) => {
+          chrome.storage.local.get([this.fullQueueStorageKey], (result) => {
+            if (chrome.runtime.lastError) {
+              reject(chrome.runtime.lastError);
+            } else {
+              resolve(result);
+            }
+          });
+        })
+      ]);
 
-      const storedData = result[this.storageKey];
+      // Load regular state
+      const storedData = regularResult[this.storageKey];
       if (storedData) {
         this.actionQueue = storedData.actionQueue || [];
-        this.lastExportQueue = storedData.lastExportQueue || [];
         this.lastActionId = storedData.lastActionId || '0';
         this.actionIdCounter = storedData.actionIdCounter || 0;
-        
-        this._log('State loaded from storage', { 
-          queueLength: this.actionQueue.length,
-          lastExportQueueLength: this.lastExportQueue.length 
-        });
       }
+
+      // Load fullQueue separately
+      const fullQueueData = fullQueueResult[this.fullQueueStorageKey];
+      if (fullQueueData && fullQueueData.compressedFullQueue) {
+        this.fullQueue = this._decompressData(fullQueueData.compressedFullQueue);
+      } else {
+        this.fullQueue = [];
+      }
+        
+      this._log('State loaded from storage', { 
+        queueLength: this.actionQueue.length,
+        fullQueueLength: this.fullQueue.length
+      });
     } catch (error) {
       this._log('Failed to load from storage', { error: error.message });
     }
   }
 
   /**
-   * Save state to Chrome storage
+   * Save regular state to Chrome storage (excluding fullQueue)
    * @returns {Promise<void>}
    */
   async _saveToStorage() {
@@ -382,7 +417,6 @@ export default class ActionSync {
     try {
       const dataToStore = {
         actionQueue: this.actionQueue,
-        lastExportQueue: this.lastExportQueue,
         lastActionId: this.lastActionId,
         actionIdCounter: this.actionIdCounter,
         timestamp: Date.now()
@@ -399,8 +433,7 @@ export default class ActionSync {
       });
 
       this._log('State saved to storage', { 
-        queueLength: this.actionQueue.length,
-        lastExportQueueLength: this.lastExportQueue.length 
+        queueLength: this.actionQueue.length
       });
     } catch (error) {
       this._log('Failed to save to storage', { error: error.message });
@@ -408,7 +441,40 @@ export default class ActionSync {
   }
 
   /**
-   * Clear storage data
+   * Save fullQueue to Chrome storage separately
+   * @returns {Promise<void>}
+   */
+  async _saveFullQueueToStorage() {
+    if (!this._isChromeStorageAvailable()) {
+      return;
+    }
+
+    try {
+      const dataToStore = {
+        compressedFullQueue: this._compressData(this.fullQueue),
+        timestamp: Date.now()
+      };
+
+      await new Promise((resolve, reject) => {
+        chrome.storage.local.set({ [this.fullQueueStorageKey]: dataToStore }, () => {
+          if (chrome.runtime.lastError) {
+            reject(chrome.runtime.lastError);
+          } else {
+            resolve();
+          }
+        });
+      });
+
+      this._log('FullQueue saved to storage', { 
+        fullQueueLength: this.fullQueue.length
+      });
+    } catch (error) {
+      this._log('Failed to save fullQueue to storage', { error: error.message });
+    }
+  }
+
+  /**
+   * Clear storage data (both regular and fullQueue storage)
    * @returns {Promise<void>}
    */
   async _clearStorage() {
@@ -418,7 +484,7 @@ export default class ActionSync {
 
     try {
       await new Promise((resolve, reject) => {
-        chrome.storage.local.remove([this.storageKey], () => {
+        chrome.storage.local.remove([this.storageKey, this.fullQueueStorageKey], () => {
           if (chrome.runtime.lastError) {
             reject(chrome.runtime.lastError);
           } else {
@@ -501,6 +567,21 @@ export default class ActionSync {
       this._log('Queue size enforced', { 
         removed: removed.length, 
         remaining: this.actionQueue.length 
+      });
+    }
+  }
+
+  /**
+   * Enforce maximum full queue size (keep only recent actions)
+   */
+  _enforceFullQueueSize() {
+    const maxFullQueueSize = this.maxQueueSize * 5; // Allow fullQueue to be 5x larger
+    if (this.fullQueue.length > maxFullQueueSize) {
+      const removed = this.fullQueue.splice(0, this.fullQueue.length - maxFullQueueSize);
+      
+      this._log('Full queue size enforced', { 
+        removed: removed.length, 
+        remaining: this.fullQueue.length 
       });
     }
   }
@@ -593,6 +674,66 @@ export default class ActionSync {
    */
   _delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Compress data using simple string compression (can be enhanced with actual compression libraries)
+   * @param {Array} data - Data to compress
+   * @returns {string} Compressed data
+   */
+  _compressData(data) {
+    // For now, use JSON.stringify as basic compression
+    // In production, you might want to use actual compression libraries like pako
+    return JSON.stringify(data);
+  }
+
+  /**
+   * Decompress data
+   * @param {string} compressedData - Compressed data
+   * @returns {Array} Decompressed data
+   */
+  _decompressData(compressedData) {
+    try {
+      return JSON.parse(compressedData);
+    } catch (error) {
+      this._log('Failed to decompress data', { error: error.message });
+      return [];
+    }
+  }
+
+  /**
+   * Check if an action payload contains all the specified keys
+   * @param {Object} payload - Action payload to check
+   * @param {Array<string>} keys - Keys that must be present
+   * @returns {boolean} True if all keys are present
+   */
+  _actionContainsKeys(payload, keys) {
+    return keys.every(key => payload.hasOwnProperty(key));
+  }
+
+  /**
+   * Remove actions from actionQueue that match the new action on all filter keys
+   * @param {Object} newPayload - Payload of the new action
+   * @param {Array<string>} filterKeys - Keys to match on
+   * @returns {number} Number of actions removed
+   */
+  _removeMatchingActions(newPayload, filterKeys) {
+    const initialLength = this.actionQueue.length;
+    
+    this.actionQueue = this.actionQueue.filter(existingAction => {
+      // Keep actions that don't match ALL filter key values
+      return !filterKeys.every(key => 
+        existingAction.payload.hasOwnProperty(key) &&
+        existingAction.payload[key] === newPayload[key]
+      );
+    });
+    
+    const removedCount = initialLength - this.actionQueue.length;
+    if (removedCount > 0) {
+      this._log('Filtered duplicate actions', { removedCount, filterKeys });
+    }
+    
+    return removedCount;
   }
 
   /**

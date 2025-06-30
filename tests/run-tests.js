@@ -192,7 +192,7 @@ test('Queue clears after sync (no resending)', async () => {
   actionSync.destroy();
 });
 
-test('Export clears queue and allows re-export', () => {
+test('Export does not clear queue', () => {
   const actionSync = new ActionSync({
     serverUrl: 'https://test.com',
     deviceId: 'test-device',
@@ -203,12 +203,12 @@ test('Export clears queue and allows re-export', () => {
   expect(actionSync.getStatus().queueLength).toBe(1);
   
   const exportData = actionSync.export();
-  expect(actionSync.getStatus().queueLength).toBe(0);
-  expect(actionSync.getStatus().lastExportQueueLength).toBe(1);
-  expect(actionSync.isSynced()).toBe(true);
+  expect(actionSync.getStatus().queueLength).toBe(1); // Queue should remain
+  expect(actionSync.isSynced()).toBe(false); // Still not synced
   
-  const reexportData = actionSync.reexportLast();
-  expect(exportData).toBe(reexportData);
+  const parsedData = JSON.parse(exportData);
+  expect(parsedData.actions.length).toBe(1);
+  expect(parsedData.actions[0].payload.type).toBe('EXPORT_TEST');
   
   actionSync.destroy();
 });
@@ -252,7 +252,6 @@ test('Error handling', () => {
   });
   
   expect(() => actionSync.import('invalid json')).toThrow('Import failed');
-  expect(() => actionSync.reexportLast()).toThrow('No previous export');
   
   actionSync.destroy();
 });
@@ -279,6 +278,34 @@ test('Chrome storage persistence', async () => {
   expect(mockStorageData[storageKey]).toBeTruthy();
   expect(mockStorageData[storageKey].actionQueue.length).toBe(2);
   expect(mockStorageData[storageKey].actionQueue[0].payload.type).toBe('PERSIST_TEST_1');
+  
+  actionSync.destroy();
+});
+
+test('Action filtering and deduplication', () => {
+  const actionSync = new ActionSync({
+    serverUrl: 'https://test.com',
+    deviceId: 'test-filter',
+    autoSync: false
+  });
+  
+  // Dispatch initial action
+  actionSync.dispatch({ type: 'SAVE_NOTE', id: 'note1', content: 'first version' });
+  actionSync.dispatch({ type: 'OTHER_ACTION', data: 'unrelated' });
+  expect(actionSync.getStatus().queueLength).toBe(2);
+  
+  // Dispatch with filter keys - should remove the previous SAVE_NOTE
+  actionSync.dispatch(
+    { type: 'SAVE_NOTE', id: 'note1', content: 'updated version' },
+    ['type', 'id']
+  );
+  
+  expect(actionSync.getStatus().queueLength).toBe(2); // Still 2 (one removed, one added)
+  
+  // Verify the content was updated
+  const saveNoteActions = actionSync.actionQueue.filter(a => a.payload.type === 'SAVE_NOTE');
+  expect(saveNoteActions.length).toBe(1);
+  expect(saveNoteActions[0].payload.content).toBe('updated version');
   
   actionSync.destroy();
 });

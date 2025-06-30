@@ -209,7 +209,7 @@ describe('ActionSync', () => {
   });
 
   describe('Export/Import with Queue Management', () => {
-    test('should clear queue after export and allow re-export', () => {
+    test('should export all actions without clearing queue', () => {
       // Add some actions
       actionSync.dispatch({ type: 'EXPORT_1' });
       actionSync.dispatch({ type: 'EXPORT_2' });
@@ -217,26 +217,75 @@ describe('ActionSync', () => {
       expect(actionSync.getStatus().queueLength).toBe(2);
       expect(actionSync.isSynced()).toBe(false);
 
-      // Export should clear the queue
+      // Export should include all actions but not clear the queue
       const exportData = actionSync.export();
-      
-      expect(actionSync.getStatus().queueLength).toBe(0);
-      expect(actionSync.getStatus().lastExportQueueLength).toBe(2);
-      expect(actionSync.isSynced()).toBe(true);
-
-      // Should be able to re-export (timestamps will differ, so check content)
-      const reexportData = actionSync.reexportLast();
       const exportParsed = JSON.parse(exportData);
-      const reexportParsed = JSON.parse(reexportData);
       
-      expect(reexportParsed.deviceId).toBe(exportParsed.deviceId);
-      expect(reexportParsed.actions).toEqual(exportParsed.actions);
-      expect(reexportParsed.lastActionId).toBe(exportParsed.lastActionId);
+      expect(actionSync.getStatus().queueLength).toBe(2); // Queue should remain
+      expect(actionSync.isSynced()).toBe(false); // Still not synced
+      expect(exportParsed.actions).toHaveLength(2);
+      expect(exportParsed.actions[0].payload.type).toBe('EXPORT_1');
+      expect(exportParsed.actions[1].payload.type).toBe('EXPORT_2');
     });
 
-    test('should throw error when re-exporting with no previous export', () => {
-      expect(() => actionSync.reexportLast()).toThrow('No previous export to re-export');
+    test('should handle multi-device scenario with fullQueue', async () => {
+      // Simulate the scenario described in the user request
+      
+      // Device dispatches actions
+      actionSync.dispatch({ type: 'ACTION_1' });
+      actionSync.dispatch({ type: 'ACTION_2' });
+      
+      expect(actionSync.getStatus().queueLength).toBe(2);
+      expect(actionSync.getStatus().fullQueueLength).toBe(0);
+      
+      // Device syncs successfully - actions move to fullQueue
+      global.fetch.mockResolvedValue(createMockResponse({
+        success: true,
+        lastActionId: 'server-123',
+        actions: []
+      }));
+      
+      await actionSync.sync();
+      
+      expect(actionSync.getStatus().queueLength).toBe(0); // Synced actions cleared
+      expect(actionSync.getStatus().fullQueueLength).toBe(2); // Moved to fullQueue
+      expect(actionSync.getStatus().totalActionsCount).toBe(2);
+      
+      // User adds more actions after sync
+      actionSync.dispatch({ type: 'ACTION_3' });
+      
+      expect(actionSync.getStatus().queueLength).toBe(1);
+      expect(actionSync.getStatus().fullQueueLength).toBe(2);
+      expect(actionSync.getStatus().totalActionsCount).toBe(3);
+      
+      // Export should include ALL actions (fullQueue + actionQueue)
+      const exportData = actionSync.export();
+      const exportParsed = JSON.parse(exportData);
+      
+      expect(exportParsed.actions).toHaveLength(3);
+      expect(exportParsed.actions[0].payload.type).toBe('ACTION_1');
+      expect(exportParsed.actions[1].payload.type).toBe('ACTION_2');
+      expect(exportParsed.actions[2].payload.type).toBe('ACTION_3');
+      
+      // New device importing should get all actions
+      const newDevice = new ActionSync({
+        deviceId: 'new-device',
+        autoSync: false,
+        retryAttempts: 1
+      });
+      
+      try {
+        const importedPayloads = newDevice.import(exportData);
+        expect(importedPayloads).toHaveLength(3);
+        expect(importedPayloads[0].type).toBe('ACTION_1');
+        expect(importedPayloads[1].type).toBe('ACTION_2');
+        expect(importedPayloads[2].type).toBe('ACTION_3');
+      } finally {
+        newDevice.destroy();
+      }
     });
+
+
 
     test('should return payloads from import', () => {
       // Create export data
@@ -270,6 +319,165 @@ describe('ActionSync', () => {
       // Import should not affect local queue
       expect(actionSync.getStatus().queueLength).toBe(0);
       expect(actionSync.isSynced()).toBe(true);
+    });
+  });
+
+  describe('Action Filtering and Deduplication', () => {
+    test('should remove duplicate actions when using filterKeys', () => {
+      // Dispatch initial actions
+      actionSync.dispatch({ type: 'SAVE_NOTE', id: 'note1', content: 'first version' });
+      actionSync.dispatch({ type: 'SAVE_NOTE', id: 'note2', content: 'another note' });
+      actionSync.dispatch({ type: 'OTHER_ACTION', data: 'unrelated' });
+      
+      expect(actionSync.getStatus().queueLength).toBe(3);
+      
+      // Dispatch with filter keys - should remove the first SAVE_NOTE with id='note1'
+      actionSync.dispatch(
+        { type: 'SAVE_NOTE', id: 'note1', content: 'updated version' },
+        ['type', 'id']
+      );
+      
+      expect(actionSync.getStatus().queueLength).toBe(3); // Still 3 total (one removed, one added)
+      
+      // Verify the remaining actions
+      const actions = actionSync.actionQueue;
+      const saveNote1Actions = actions.filter(a => a.payload.type === 'SAVE_NOTE' && a.payload.id === 'note1');
+      const saveNote2Actions = actions.filter(a => a.payload.type === 'SAVE_NOTE' && a.payload.id === 'note2');
+      const otherActions = actions.filter(a => a.payload.type === 'OTHER_ACTION');
+      
+      expect(saveNote1Actions).toHaveLength(1);
+      expect(saveNote1Actions[0].payload.content).toBe('updated version');
+      expect(saveNote2Actions).toHaveLength(1);
+      expect(otherActions).toHaveLength(1);
+    });
+
+    test('should not remove actions if filter keys do not match', () => {
+      // Dispatch initial actions
+      actionSync.dispatch({ type: 'SAVE_NOTE', id: 'note1', content: 'first version' });
+      actionSync.dispatch({ type: 'SAVE_NOTE', id: 'note2', content: 'another note' });
+      
+      expect(actionSync.getStatus().queueLength).toBe(2);
+      
+      // Dispatch with different id - should not remove any existing actions
+      actionSync.dispatch(
+        { type: 'SAVE_NOTE', id: 'note3', content: 'new note' },
+        ['type', 'id']
+      );
+      
+      expect(actionSync.getStatus().queueLength).toBe(3); // All 3 should remain
+      
+      const noteActions = actionSync.actionQueue.filter(a => a.payload.type === 'SAVE_NOTE');
+      expect(noteActions).toHaveLength(3);
+    });
+
+    test('should work with single filter key', () => {
+      // Dispatch actions with same type
+      actionSync.dispatch({ type: 'USER_PREF', setting: 'theme', value: 'dark' });
+      actionSync.dispatch({ type: 'USER_PREF', setting: 'lang', value: 'en' });
+      actionSync.dispatch({ type: 'OTHER_ACTION', data: 'test' });
+      
+      expect(actionSync.getStatus().queueLength).toBe(3);
+      
+      // Dispatch with type filter - should remove all USER_PREF actions
+      actionSync.dispatch(
+        { type: 'USER_PREF', setting: 'theme', value: 'light' },
+        ['type']
+      );
+      
+      expect(actionSync.getStatus().queueLength).toBe(2); // 2 removed, 1 added = 2 total
+      
+      const userPrefActions = actionSync.actionQueue.filter(a => a.payload.type === 'USER_PREF');
+      const otherActions = actionSync.actionQueue.filter(a => a.payload.type === 'OTHER_ACTION');
+      
+      expect(userPrefActions).toHaveLength(1);
+      expect(userPrefActions[0].payload.value).toBe('light');
+      expect(otherActions).toHaveLength(1);
+    });
+
+    test('should not filter if new action does not contain all filter keys', () => {
+      // Dispatch initial action
+      actionSync.dispatch({ type: 'SAVE_NOTE', id: 'note1', content: 'first version' });
+      
+      expect(actionSync.getStatus().queueLength).toBe(1);
+      
+      // Dispatch action without 'id' key - should not filter
+      actionSync.dispatch(
+        { type: 'SAVE_NOTE', content: 'no id action' },
+        ['type', 'id']
+      );
+      
+      expect(actionSync.getStatus().queueLength).toBe(2); // Both should remain
+    });
+
+    test('should handle empty filterKeys gracefully', () => {
+      actionSync.dispatch({ type: 'TEST_ACTION', data: 'test1' });
+      actionSync.dispatch({ type: 'TEST_ACTION', data: 'test2' });
+      
+      expect(actionSync.getStatus().queueLength).toBe(2);
+      
+      // Dispatch with empty filterKeys - should not remove anything
+      actionSync.dispatch({ type: 'TEST_ACTION', data: 'test3' }, []);
+      
+      expect(actionSync.getStatus().queueLength).toBe(3);
+    });
+
+    test('should validate filterKeys parameter', () => {
+      expect(() => {
+        actionSync.dispatch({ type: 'TEST' }, 'not-an-array');
+      }).toThrow('filterKeys must be an array');
+      
+      expect(() => {
+        actionSync.dispatch({ type: 'TEST' }, null);
+      }).toThrow('filterKeys must be an array');
+    });
+
+    test('should work with complex filter keys', () => {
+      // Dispatch actions with nested properties
+      actionSync.dispatch({ 
+        type: 'UPDATE_ENTITY', 
+        entity: 'user', 
+        id: '123', 
+        data: { name: 'John', age: 30 } 
+      });
+      
+      actionSync.dispatch({ 
+        type: 'UPDATE_ENTITY', 
+        entity: 'user', 
+        id: '456', 
+        data: { name: 'Jane', age: 25 } 
+      });
+      
+      actionSync.dispatch({ 
+        type: 'UPDATE_ENTITY', 
+        entity: 'post', 
+        id: '123', 
+        data: { title: 'Post title' } 
+      });
+      
+      expect(actionSync.getStatus().queueLength).toBe(3);
+      
+      // Update user 123 - should remove first action but keep others
+      actionSync.dispatch(
+        { 
+          type: 'UPDATE_ENTITY', 
+          entity: 'user', 
+          id: '123', 
+          data: { name: 'John Updated', age: 31 } 
+        },
+        ['type', 'entity', 'id']
+      );
+      
+      expect(actionSync.getStatus().queueLength).toBe(3); // 1 removed, 1 added
+      
+      const actions = actionSync.actionQueue;
+      const user123Actions = actions.filter(a => 
+        a.payload.type === 'UPDATE_ENTITY' && 
+        a.payload.entity === 'user' && 
+        a.payload.id === '123'
+      );
+      
+      expect(user123Actions).toHaveLength(1);
+      expect(user123Actions[0].payload.data.name).toBe('John Updated');
     });
   });
 
@@ -372,13 +580,18 @@ describe('ActionSync', () => {
             payload: { type: 'STORED_ACTION_1' }
           }
         ],
-        lastExportQueue: [],
         lastActionId: 'stored-last-id',
         actionIdCounter: 5
       };
 
       chrome.storage.local.get.mockImplementation((keys, callback) => {
-        callback({ [`actionsync_${mockDeviceId}`]: testData });
+        if (keys.includes(`actionsync_${mockDeviceId}`)) {
+          callback({ [`actionsync_${mockDeviceId}`]: testData });
+        } else if (keys.includes(`actionsync_full_${mockDeviceId}`)) {
+          callback({ [`actionsync_full_${mockDeviceId}`]: null });
+        } else {
+          callback({});
+        }
       });
 
       // Create new instance to test loading
@@ -424,14 +637,22 @@ describe('ActionSync', () => {
       // Wait for sync save
       await delay(10);
 
-      // Verify additional storage save was called after sync
+      // Verify additional storage saves were called after sync (both regular and fullQueue)
       expect(chrome.storage.local.set.mock.calls.length).toBeGreaterThan(setCallsBefore);
       
-      // Get the latest stored data
-      const lastSetCall = chrome.storage.local.set.mock.calls[chrome.storage.local.set.mock.calls.length - 1];
-      const storedData = lastSetCall[0][`actionsync_${mockDeviceId}`];
+      // Find the call that saved regular actionQueue data (not fullQueue)
+      let actionQueueStorageCall = null;
+      for (let i = setCallsBefore; i < chrome.storage.local.set.mock.calls.length; i++) {
+        const call = chrome.storage.local.set.mock.calls[i];
+        const data = call[0][`actionsync_${mockDeviceId}`];
+        if (data && data.hasOwnProperty('actionQueue')) {
+          actionQueueStorageCall = data;
+          break;
+        }
+      }
       
-      expect(storedData.actionQueue).toHaveLength(0); // Queue should be empty after sync
+      expect(actionQueueStorageCall).not.toBeNull();
+      expect(actionQueueStorageCall.actionQueue).toHaveLength(0); // Queue should be empty after sync
     });
 
     test('should clear storage on destroy', async () => {
@@ -443,8 +664,8 @@ describe('ActionSync', () => {
       // Wait for async clear operation
       await delay(10);
 
-      // Verify storage remove was called
-      expect(chrome.storage.local.remove).toHaveBeenCalledWith([`actionsync_${mockDeviceId}`], expect.any(Function));
+      // Verify storage remove was called with both storage keys
+      expect(chrome.storage.local.remove).toHaveBeenCalledWith([`actionsync_${mockDeviceId}`, `actionsync_full_${mockDeviceId}`], expect.any(Function));
     });
 
     test('should handle storage errors gracefully', async () => {
